@@ -21,9 +21,15 @@ from sentinelhub import (
 from config.sentinel_config import config
 from PIL import Image
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+MAX_THREADS = 6  
+
 #CONFIG
-DATA_CSV = "data/processed/train_clean.csv"
-IMAGE_DIR = "data/images/sentinel"
+DATA_CSV = "data/processed/test_clean.csv"
+SPLIT = "test"  
+IMAGE_DIR = f"data/images/sentinel_{SPLIT}"
+os.makedirs(IMAGE_DIR, exist_ok=True)
 RESOLUTION = 10        # meters per pixel (Sentinel-2 RGB)
 IMG_SIZE = 256         # final image size (256x256)
 TIME_RANGE = ("2022-01-01", "2023-12-31")
@@ -53,25 +59,23 @@ function evaluatePixel(sample) {
   return [sample.B04, sample.B03, sample.B02]; // RGB
 }
 """
-
-
 def fetch_sentinel_image(lat, lon, save_path):
     """
     Fetch Sentinel-2 RGB image around (lat, lon)
     """
 
-    # Define bounding box
+    # Half-size in degrees for 256x256 @ 10m
+    half_size = (IMG_SIZE * RESOLUTION) / 2 / 111320
+
     bbox = BBox(
         bbox=[
-            lon - 0.01,
-            lat - 0.01,
-            lon + 0.01,
-            lat + 0.01
+            lon - half_size,
+            lat - half_size,
+            lon + half_size,
+            lat + half_size
         ],
         crs=CRS.WGS84
     )
-
-    size = bbox_to_dimensions(bbox, resolution=RESOLUTION)
 
     request = SentinelHubRequest(
         evalscript=evalscript,
@@ -87,19 +91,79 @@ def fetch_sentinel_image(lat, lon, save_path):
             SentinelHubRequest.output_response("default", MimeType.PNG)
         ],
         bbox=bbox,
-        size=size,
+        size=(IMG_SIZE, IMG_SIZE),  # DIRECT 256x256
         config=config
     )
 
     image = request.get_data(save_data=False)[0]
 
-    if image is not None:
-        from PIL import Image
-        img = Image.fromarray(image)
-        img = img.resize((IMG_SIZE, IMG_SIZE))
-        img.save(save_path)
-    else:
-        raise ValueError("No image returned by SentinelHub")
+    if image is None:
+        raise ValueError("No image returned")
+
+    Image.fromarray(image).save(save_path)
+
+def process_row(row):
+    img_id = row.name  # index
+    img_path = os.path.join(IMAGE_DIR, f"{img_id}.png")
+
+    if os.path.exists(img_path):
+        return f"{img_id} SKIPPED"
+
+    success = fetch_with_retry(
+        row["lat"],
+        row["long"],
+        img_path,
+        retries=RETRIES,
+        delay=DELAY
+    )
+
+    return f"{img_id} {'OK' if success else 'FAIL'}"
+
+# def fetch_sentinel_image(lat, lon, save_path):
+#     """
+#     Fetch Sentinel-2 RGB image around (lat, lon)
+#     """
+
+#     # Define bounding box
+#     bbox = BBox(
+#         bbox=[
+#             lon - 0.01,
+#             lat - 0.01,
+#             lon + 0.01,
+#             lat + 0.01
+#         ],
+#         crs=CRS.WGS84
+#     )
+
+#     size = bbox_to_dimensions(bbox, resolution=RESOLUTION)
+
+#     request = SentinelHubRequest(
+#         evalscript=evalscript,
+#         input_data=[
+#             SentinelHubRequest.input_data(
+#                 data_collection=DataCollection.SENTINEL2_L2A,
+#                 time_interval=TIME_RANGE,
+#                 mosaicking_order="leastCC",
+#                 maxcc=MAX_CLOUD / 100
+#             )
+#         ],
+#         responses=[
+#             SentinelHubRequest.output_response("default", MimeType.PNG)
+#         ],
+#         bbox=bbox,
+#         size=size,
+#         config=config
+#     )
+
+#     image = request.get_data(save_data=False)[0]
+
+#     if image is not None:
+#         from PIL import Image
+#         img = Image.fromarray(image)
+#         img = img.resize((IMG_SIZE, IMG_SIZE))
+#         img.save(save_path)
+#     else:
+#         raise ValueError("No image returned by SentinelHub")
 
 def fetch_with_retry(lat, lon, save_path, retries=3, delay=5):
     """Retry logic with delay"""
@@ -113,40 +177,36 @@ def fetch_with_retry(lat, lon, save_path, retries=3, delay=5):
     print(f"Failed to download {save_path} after {retries} attempts.")
     return False
 
-# DOWNLOAD LOOP
-# MAX_IMAGES = 500   
+# LOG_FILE = "download_log_test.txt"
 
-# for idx, row in tqdm(df.iterrows(), total=len(df)):
+# with open(LOG_FILE, "a") as log_file:
+#     for idx, row in tqdm(df.iterrows(), total=len(df)):
 
-#     if idx >= MAX_IMAGES:
-#         break
+#         img_path = os.path.join(IMAGE_DIR, f"{idx}.png")
 
-#     img_path = os.path.join(IMAGE_DIR, f"{idx}.png")
-#     if os.path.exists(img_path):
-#         continue  #Shifts already downloaded image
-#     try:
-#         fetch_sentinel_image(row["lat"], row["long"], img_path)
-#     except Exception as e:
-#         print(f"Error at index {idx}: {e}")
+#         # Skip if already exists (partial download check)
+#         if os.path.exists(img_path):
+#             log_file.write(f"{idx} SKIPPED (exists)\n")
+#             continue
 
-LOG_FILE = "download_log.txt"
-
-with open(LOG_FILE, "a") as log_file:
-    for idx, row in tqdm(df.iterrows(), total=len(df)):
-
-        img_path = os.path.join(IMAGE_DIR, f"{idx}.png")
-
-        # Skip if already exists (partial download check)
-        if os.path.exists(img_path):
-            log_file.write(f"{idx} SKIPPED (exists)\n")
-            continue
-
-        success = fetch_with_retry(row["lat"], row["long"], img_path)
-        if success:
-            log_file.write(f"{idx} OK\n")
-        else:
-            log_file.write(f"{idx} FAIL\n")
+#         success = fetch_with_retry(row["lat"], row["long"], img_path)
+#         if success:
+#             log_file.write(f"{idx} OK\n")
+#         else:
+#             log_file.write(f"{idx} FAIL\n")
         
+LOG_FILE = "download_log_test.txt"
+
+tasks = []
+
+with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+    for _, row in df.iterrows():
+        tasks.append(executor.submit(process_row, row))
+
+    with open(LOG_FILE, "a") as log_file:
+        for future in tqdm(as_completed(tasks), total=len(tasks)):
+            log_file.write(future.result() + "\n")
+
 
 # def fetch_with_retry(lat, lon, save_path, retries=RETRIES, delay=DELAY):
 #     """Retry logic for a single image"""

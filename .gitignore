@@ -1,7 +1,4 @@
 .venv/
 data/
-train_clean.zip
-sentinel_images.zip
-Documentation.docx
 config/
 models/
